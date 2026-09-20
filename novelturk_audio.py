@@ -61,8 +61,8 @@ log = logging.getLogger("novelturk_audio")
 
 # ===================== AYARLAR =====================
 SERIES = [
-    "https://novelturk.com/novel/solo-farming-in-the-tower/",
-    # "Solo Farming Tower",
+    "https://novelturk.com/novel/my-vampire-system/",
+    # "My Vampire System",
 ]
 MAX_CHAPTERS = 5        # None = serinin tamami. Yeni seride once 3 ile deneyin.
 DELAY = (1.0, 2.2)      # bolumler arasi rastgele bekleme (sn)
