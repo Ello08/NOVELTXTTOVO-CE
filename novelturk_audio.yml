@@ -1,0 +1,226 @@
+name: NovelTurk -> Sesli Kitap (MP3)
+
+on:
+  workflow_dispatch:
+    inputs:
+      series:
+        description: "Seri linki veya slug (virgulle ayirin)"
+        required: true
+        default: "https://novelturk.com/novel/solo-farming-in-the-tower/"
+        type: string
+      max_chapters:
+        description: "Seri basina bolum siniri (0 = tum seri)"
+        required: true
+        default: "5"
+        type: string
+      voice:
+        description: "Ses secenegi"
+        required: true
+        default: "tr-TR-AhmetNeural"
+        type: choice
+        options:
+          - tr-TR-AhmetNeural
+          - tr-TR-EmelNeural
+      rate:
+        description: "Konusma hizi (ornek: +0%, +10%, -15%)"
+        required: false
+        default: "+0%"
+        type: string
+      chapters_per_job:
+        description: "Her paralel ses job'inin isleyecegi en fazla bolum sayisi"
+        required: true
+        default: "100"
+        type: string
+      max_parallel:
+        description: "Ayni anda calisacak en fazla ses job'i (ucretsiz planda ust sinir 20)"
+        required: true
+        default: "10"
+        type: string
+      probe:
+        description: "Sadece erisim tanisi yap (indirme ve ses yok)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1) Bolumleri sirayla cek -> TXT (kazima paralellesmez: her bolumun
+  #    "sonraki" baglantisi bir onceki sayfadan gelir)  +  paralel is plani
+  # ---------------------------------------------------------------------
+  scrape:
+    name: Bolumleri cek (TXT)
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    outputs:
+      # probe modunda plan adimi calismaz; matrix bos kalmasin diye yedek deger
+      matrix: "${{ steps.plan.outputs.matrix || '{\"include\":[{\"shard\":0}]}' }}"
+      shards: ${{ steps.plan.outputs.shards }}
+    env:
+      # Girdiler shell komutuna dogrudan gomulmez (script injection'a karsi)
+      NT_SERIES: ${{ inputs.series }}
+      NT_MAX_CHAPTERS: ${{ inputs.max_chapters }}
+      NT_OUT: out
+      PER_JOB: ${{ inputs.chapters_per_job }}
+      NOVELTURK_PROXY: ${{ secrets.NOVELTURK_PROXY }}   # istege bagli
+
+    steps:
+      - name: Depoyu cek
+        uses: actions/checkout@v7
+
+      - name: Python kur
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: "Bagimliliklar (curl_cffi guncel olmali, yeni tarayici parmak izleri icin)"
+        run: python -m pip install -U curl_cffi beautifulsoup4 lxml edge-tts tqdm
+
+      - name: Erisim tanisi (probe)
+        if: ${{ inputs.probe }}
+        run: python novelturk_audio.py probe
+
+      - name: Bolum onbellegini geri yukle
+        if: ${{ !inputs.probe }}
+        uses: actions/cache/restore@v6
+        with:
+          path: out/novelturk_cache
+          key: nt-cache-${{ github.run_id }}
+          restore-keys: nt-cache-
+
+      - name: Bolumleri TXT olarak cek
+        if: ${{ !inputs.probe }}
+        run: python novelturk_audio.py scrape --txt-dir txt
+
+      - name: Bolum onbellegini kaydet
+        if: ${{ !inputs.probe && always() }}
+        uses: actions/cache/save@v6
+        with:
+          path: out/novelturk_cache
+          key: nt-cache-${{ github.run_id }}
+
+      - name: TXT dosyalarini yukle
+        if: ${{ !inputs.probe && always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: txt-${{ github.run_id }}
+          path: txt/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Teshis (kac TXT uretildi, ilk dosyalar ne?)
+        if: ${{ !inputs.probe }}
+        run: |
+          find txt -name '*.txt' | wc -l
+          find txt -name '*.txt' | sort | head -5
+
+      - name: Paralel is plani olustur
+        id: plan
+        if: ${{ !inputs.probe }}
+        run: python novelturk_audio.py plan --txt-dir txt --per-job "$PER_JOB"
+
+  # ---------------------------------------------------------------------
+  # 2) Her bolum araligini ayri bir runner'da seslendir
+  # ---------------------------------------------------------------------
+  convert:
+    name: Ses ${{ matrix.shard }} - ${{ matrix.slug }} (bolum ${{ matrix.start }}-${{ matrix.end }})
+    needs: scrape
+    if: ${{ !inputs.probe }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false   # bir parca patlasa da digerleri devam etsin
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix: ${{ fromJSON(needs.scrape.outputs.matrix) }}
+    env:
+      SLUG: ${{ matrix.slug }}
+      START: ${{ matrix.start }}
+      END: ${{ matrix.end }}
+      VOICE: ${{ inputs.voice }}
+      RATE: ${{ inputs.rate }}
+
+    steps:
+      - name: Depoyu cek
+        uses: actions/checkout@v7
+
+      - name: Python kur
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Bagimliliklar
+        run: python -m pip install -U curl_cffi beautifulsoup4 lxml edge-tts tqdm
+
+      - name: TXT dosyalarini indir
+        uses: actions/download-artifact@v8
+        with:
+          name: txt-${{ github.run_id }}
+          path: txt
+
+      - name: Teshis (TXT klasorunde ne var, hangi aralik islenecek?)
+        run: |
+          echo "Seri: $SLUG | aralik: $START-$END"
+          ls txt
+          echo "TXT sayisi: $(find "txt/$SLUG" -name '*.txt' | wc -l)"
+          ls "txt/$SLUG" | sed -n '1,5p'
+
+      - name: Bolum araligini sesli kitaba donustur
+        # script '--rate -15%' yazimini da '--rate=-15%' olarak cozer; '=' bicimi yine de en guvenlisi
+        run: |
+          python novelturk_audio.py tts \
+            --txt-dir txt \
+            --out-dir audio_out \
+            --slug "$SLUG" \
+            --start "$START" \
+            --end "$END" \
+            --voice "$VOICE" \
+            --rate="${RATE:-+0%}"
+
+      - name: Ozet yaz
+        if: always()
+        run: |
+          {
+            echo "### Parça ${{ matrix.shard }} — $SLUG (bölüm $START-$END)"
+            echo ""
+            if [ -d audio_out ] && [ -n "$(find audio_out -name '*.mp3' -print -quit)" ]; then
+              find audio_out -name '*.mp3' -printf '- `%P` — %k KiB\n' | sort
+            else
+              echo "_Hiç MP3 üretilmedi._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: MP3 dosyalarini artifact olarak yukle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: audio-${{ github.run_id }}-part-${{ matrix.shard }}
+          path: audio_out/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0   # MP3 zaten sikistirilmis
+
+  # ---------------------------------------------------------------------
+  # 3) Tum parcalari tek artifact'ta birlestir
+  # ---------------------------------------------------------------------
+  merge:
+    name: Artifact'lari birlestir
+    needs: [scrape, convert]
+    if: ${{ !cancelled() && !inputs.probe && needs.scrape.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: write   # delete-merged: parca artifact'larini silebilmek icin
+    steps:
+      - name: Parcalari tek artifact'ta topla
+        uses: actions/upload-artifact/merge@v7
+        with:
+          name: audiobook-${{ github.run_id }}
+          pattern: audio-${{ github.run_id }}-part-*
+          delete-merged: true
+          retention-days: 7
+          compression-level: 0
